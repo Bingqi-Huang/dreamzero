@@ -3,15 +3,17 @@
 #
 # Usage (recommended — with real calibration data):
 #   bash scripts/inference/build_trt_engine.sh \
-#       --model-path ./checkpoints/DreamZero-DROID \
+#       --model-path ./checkpoints/DreamZero-AgiBot \
+#       --embodiment-tag agibot \
+#       --model-type ar_14B \
 #       --tensorrt nvfp4 \
-#       --dataset-path ./data/droid_lerobot \
+#       --dataset-path ./data/agibot_lerobot \
 #       --cuda-device 0
 #
 # Usage (without dataset — acceptable for fp16, not recommended for nvfp4/fp8):
 #   bash scripts/inference/build_trt_engine.sh \
-#       --model-path ./checkpoints/DreamZero-DROID \
-#       --tensorrt nvfp4 \
+#       --model-path ./checkpoints/DreamZero-AgiBot \
+#       --tensorrt fp16 \
 #       --cuda-device 0
 #
 # The engine is saved to:
@@ -36,6 +38,8 @@ TENSORRT_PRECISION=""
 CUDA_DEVICE="0"
 DATASET_PATH=""
 NUM_CALIBRATION_TRAJS="2"
+EMBODIMENT_TAG="agibot"
+MODEL_TYPE="ar_14B"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -45,6 +49,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --tensorrt)
             TENSORRT_PRECISION="$2"
+            shift 2
+            ;;
+        --embodiment-tag)
+            EMBODIMENT_TAG="$2"
+            shift 2
+            ;;
+        --model-type)
+            MODEL_TYPE="$2"
             shift 2
             ;;
         --cuda-device)
@@ -64,6 +76,8 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --model-path PATH             Path to DreamZero checkpoint directory"
+            echo "  --embodiment-tag TAG          Embodiment tag for metadata/transforms (default: agibot)"
+            echo "  --model-type TYPE             TRT shape/template type: ar_14B, ar_14B_droid, ar_5B_n6 (default: ar_14B)"
             echo "  --tensorrt PRECISION          TRT precision: nvfp4 (recommended), fp8, fp16"
             echo "  --dataset-path PATH           LeRobot dataset for real calibration (recommended for nvfp4/fp8)"
             echo "  --num-calibration-trajs N     Number of calibration trajectories (default: 2)"
@@ -97,6 +111,8 @@ ENGINE_PATH="${MODEL_PATH}/tensorrt/wan/WanModel_${TENSORRT_PRECISION}.trt"
 echo "=========================================="
 echo "DreamZero TensorRT Engine Builder"
 echo "  Checkpoint         : $MODEL_PATH"
+echo "  Embodiment tag     : $EMBODIMENT_TAG"
+echo "  Model type         : $MODEL_TYPE"
 echo "  Precision          : $TENSORRT_PRECISION"
 echo "  CUDA device        : $CUDA_DEVICE"
 echo "  Dataset (calibrate): ${DATASET_PATH:-<none — using dummy inputs>}"
@@ -108,7 +124,7 @@ echo "=========================================="
 # (it activates flash-attention compatibility mode required for ONNX/TRT export).
 export ENABLE_TENSORRT=true
 export CUDA_VISIBLE_DEVICES="$CUDA_DEVICE"
-export ATTENTION_BACKEND="TE"
+export ATTENTION_BACKEND="${ATTENTION_BACKEND:-torch}"
 export HYDRA_FULL_ERROR=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -117,6 +133,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # Build the Python argument list.
 PYTHON_ARGS=(
     --model-path "$MODEL_PATH"
+    --embodiment-tag "$EMBODIMENT_TAG"
+    --model-type "$MODEL_TYPE"
     --tensorrt   "$TENSORRT_PRECISION"
     --num-calibration-trajs "$NUM_CALIBRATION_TRAJS"
 )
@@ -124,12 +142,13 @@ if [[ -n "$DATASET_PATH" ]]; then
     PYTHON_ARGS+=(--dataset-path "$DATASET_PATH")
 fi
 
-# torchrun sets RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT which are
-# required by GrootSimPolicy's distributed init.
-torchrun \
+# torch.distributed.run sets RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT
+# which are required by GrootSimPolicy's distributed init. Set PYTHON to
+# "uv run python" when using this repository's uv-managed virtualenv.
+${PYTHON:-python} -m torch.distributed.run \
     --standalone \
     --nproc_per_node=1 \
-    "${REPO_ROOT}/scripts/inference/build_trt_engine_droid.py" \
+    "${REPO_ROOT}/scripts/inference/build_trt_engine.py" \
     "${PYTHON_ARGS[@]}"
 
 echo "=========================================="
@@ -138,5 +157,5 @@ echo ""
 echo "Run inference with:"
 echo "  CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 \\"
 echo "      socket_test_optimized_AR.py --port 5000 --enable-dit-cache \\"
-echo "      --model-path ${MODEL_PATH} --tensorrt ${TENSORRT_PRECISION}"
+echo "      --model-path ${MODEL_PATH}"
 echo "=========================================="

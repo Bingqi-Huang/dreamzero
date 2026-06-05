@@ -17,6 +17,11 @@ Step 5  Create a training script
 Step 6  Train
 ```
 
+For the local Realman robot datasets under `/home/bingqi/data/bingqi/CoRL26`,
+see [Realman Post-Training Workflow](REALMAN_POST_TRAINING.md). That note records
+the exact 3-view mapping, metadata helper script, LoRA training command, and
+post-training TensorRT/NVFP4 inference path.
+
 ---
 
 ## Step 1: Convert Dataset to GEAR Format
@@ -340,10 +345,10 @@ TOKENIZER_DIR=${TOKENIZER_DIR:-"./checkpoints/umt5-xxl"}
 
 # Auto-download weights if missing
 if [ ! -d "$WAN_CKPT_DIR" ] || [ -z "$(ls -A "$WAN_CKPT_DIR" 2>/dev/null)" ]; then
-    huggingface-cli download Wan-AI/Wan2.1-I2V-14B-480P --local-dir "$WAN_CKPT_DIR"
+    hf download Wan-AI/Wan2.1-I2V-14B-480P --local-dir "$WAN_CKPT_DIR"
 fi
 if [ ! -d "$TOKENIZER_DIR" ] || [ -z "$(ls -A "$TOKENIZER_DIR" 2>/dev/null)" ]; then
-    huggingface-cli download google/umt5-xxl --local-dir "$TOKENIZER_DIR"
+    hf download google/umt5-xxl --local-dir "$TOKENIZER_DIR"
 fi
 
 if [ ! -d "$DATA_ROOT" ]; then

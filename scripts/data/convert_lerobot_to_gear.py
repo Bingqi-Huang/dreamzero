@@ -62,7 +62,7 @@ VALID_EMBODIMENT_TAGS = [
     "real_panda_single_arm", "hot3d_hands_only",
     "gr1_unified", "robocasa_gr1_arms_waist_fourier_hands",
     "agibot", "lapa", "oxe_mutex", "oxe_roboset", "oxe_plex",
-    "dream", "yam", "xdof",
+    "dream", "yam", "realman", "xdof",
     "gr1_unified_segmentation", "language_table_sim", "gr1_isaac",
     "sim_behavior_r1_pro", "mecka_hands", "real_r1_pro_sharpa",
 ]
@@ -325,8 +325,35 @@ def compute_relative_stats(
 # Tasks & episodes
 # ---------------------------------------------------------------------------
 
-def build_tasks(parquet_paths: list[Path], task_key: str | None) -> list[dict]:
+def load_existing_tasks(tasks_path: Path) -> list[dict] | None:
+    if not tasks_path.exists():
+        return None
+    tasks = []
+    with open(tasks_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            tasks.append(json.loads(line))
+    if not tasks:
+        return None
+    if all("task_index" in task and "task" in task for task in tasks):
+        return sorted(tasks, key=lambda task: task["task_index"])
+    return None
+
+
+def build_tasks(
+    parquet_paths: list[Path],
+    task_key: str | None,
+    existing_tasks_path: Path | None = None,
+) -> list[dict]:
     """Build tasks.jsonl entries from the dataset."""
+    if task_key is not None and task_key.split(".")[-1] == "task_index" and existing_tasks_path:
+        existing_tasks = load_existing_tasks(existing_tasks_path)
+        if existing_tasks is not None:
+            log.info("  Preserving task texts from existing %s", existing_tasks_path)
+            return existing_tasks
+
     if task_key is None:
         return [{"task_index": 0, "task": ""}]
 
@@ -578,7 +605,7 @@ def main():
     if tasks_path.exists() and not args.force:
         log.info("  tasks.jsonl already exists, skipping")
     else:
-        tasks = build_tasks(parquet_paths, task_key)
+        tasks = build_tasks(parquet_paths, task_key, tasks_path)
         with open(tasks_path, "w") as f:
             for t in tasks:
                 f.write(json.dumps(t) + "\n")

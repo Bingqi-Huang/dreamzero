@@ -1768,7 +1768,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # time embeddings: expand to exactly seq_len so e matches x (5B: frame_seqlen=50, 1 frame -> 50 tokens)
         if F <= seq_len:
             repeat = (seq_len + F - 1) // F
-            timestep = timestep.repeat_interleave(repeat, dim=1)[:, :seq_len]
+            timestep = timestep.unsqueeze(2).expand(-1, -1, repeat).reshape(timestep.shape[0], -1)[:, :seq_len]
         else:
             indices = torch.linspace(0, F - 1, seq_len, device=timestep.device, dtype=torch.long)
             timestep = timestep[:, indices]
@@ -2140,7 +2140,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     use_reentrant=False,
                 )
             else:
-                x = block(x, **kwargs)
+                # block.forward returns (x, updated_kv_cache); the checkpointing
+                # path unpacks via create_custom_forward, so the non-checkpointing
+                # path must unpack too (otherwise x becomes a tuple).
+                x, updated_kv_cache = block(x, **kwargs)
+                assert updated_kv_cache is None
 
         if clean_x is not None:
             x = x[:, clean_x.shape[1]:]

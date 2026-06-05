@@ -482,16 +482,23 @@ class BaseTrainer(transformers.Trainer):
     def save_model(self, output_dir: Optional[str], _internal_call: bool):
 
         ## save tuned model separately
-        if self.is_deepspeed_enabled:
+        if self.base_cfg.save_lora_only:
+            # Save only the trainable (LoRA) parameters. Under DeepSpeed ZeRO-2 the
+            # parameters are NOT sharded -- every rank holds a full replica -- so
+            # self.model.state_dict() already contains them and no DeepSpeed gather
+            # is needed. Critically, do NOT call accelerator.get_state_dict() on this
+            # path: under ZeRO-2 it clones the ENTIRE 14B model to CPU host RAM on
+            # every rank (~28GB x num_ranks ~= 168GB), and we would immediately throw
+            # it away below. That host-RAM spike, colliding with dataloader shard
+            # caching at the save step, OOM-killed a DataLoader worker (signal: Killed)
+            # and crashed the whole run at the first checkpoint. The saved file is
+            # identical -- this only removes the dead 168GB allocation.
+            train_key = [k for k, v in self.model.named_parameters() if v.requires_grad]
+            state_dict = {k: v for k, v in self.model.state_dict().items() if k in train_key}
+        elif self.is_deepspeed_enabled:
             state_dict = self.accelerator.get_state_dict(self.deepspeed)
         else:
             state_dict = self.model.state_dict()
-
-        if self.base_cfg.save_lora_only:
-            # Save only the trainable parameters
-            train_key = [k for k, v in self.model.named_parameters() if v.requires_grad]
-            lora_state_dict = {k: v for k, v in self.model.state_dict().items() if k in train_key}
-            state_dict = lora_state_dict
 
         if self.args.should_save:
             ret = self.model.save_pretrained(output_dir, state_dict=state_dict)
@@ -697,12 +704,85 @@ class BaseExperiment(ABC):
         self.train_dataset = train_dataset
         self.trainer = trainer
 
+    def _rank_print(self, message: str) -> None:
+        rank = int(os.environ.get("RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size > 1:
+            print(f"[dist-{rank}-of-{world_size}] {message}", flush=True)
+        else:
+            print(message, flush=True)
+
+    def _wait_for_marker(self, marker_path: Path, timeout_sec: int, description: str) -> None:
+        start_time = time.time()
+        while not marker_path.exists():
+            if time.time() - start_time > timeout_sec:
+                raise TimeoutError(f"Timed out waiting for {description}: {marker_path}")
+            time.sleep(1)
+
+    def _stagger_model_init_begin(self, training_args):
+        stagger = os.environ.get("STAGGER_MODEL_INIT", "0").lower() in ("1", "true", "yes")
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if not stagger or world_size <= 1:
+            return None
+
+        rank = int(os.environ.get("RANK", "0"))
+        session_id = os.environ.get("DREAMZERO_INIT_SESSION_ID", "default")
+        timeout_sec = int(os.environ.get("STAGGER_MODEL_INIT_TIMEOUT_SEC", "1800"))
+        group_size = max(1, int(os.environ.get("STAGGER_MODEL_INIT_GROUP_SIZE", "1")))
+        marker_dir = Path(training_args.output_dir) / ".staggered_model_init" / session_id
+        marker_dir.mkdir(parents=True, exist_ok=True)
+
+        group_start = (rank // group_size) * group_size
+        if group_start > 0:
+            prev_group_end_rank = group_start - 1
+            prev_marker = marker_dir / f"rank_{prev_group_end_rank}.done"
+            self._rank_print(
+                f"Waiting for rank {prev_group_end_rank} model init marker before "
+                f"initializing rank group {group_start}-{min(group_start + group_size - 1, world_size - 1)}"
+            )
+            self._wait_for_marker(prev_marker, timeout_sec, f"rank {prev_group_end_rank} model init")
+
+        self._rank_print(
+            f"Starting model init/load in rank group "
+            f"{group_start}-{min(group_start + group_size - 1, world_size - 1)}"
+        )
+        return marker_dir, rank, world_size, timeout_sec
+
+    def _stagger_model_init_finish(self, stagger_state) -> None:
+        if stagger_state is None:
+            return
+
+        marker_dir, rank, world_size, timeout_sec = stagger_state
+        marker_path = marker_dir / f"rank_{rank}.done"
+        marker_path.write_text(str(time.time()))
+        self._rank_print(f"Finished model init/load; wrote {marker_path.name}")
+
+        final_marker = marker_dir / f"rank_{world_size - 1}.done"
+        self._wait_for_marker(final_marker, timeout_sec, f"rank {world_size - 1} model init")
+
     def create_model(self, cfg, training_args):
-        model = instantiate(cfg.model)
+        import gc
+
+        stagger_state = self._stagger_model_init_begin(training_args)
+
+        model_init_dtype_name = os.environ.get(
+            "DREAMZERO_MODEL_INIT_DTYPE",
+            str(OmegaConf.select(cfg, "model.config.model_dtype", default="float32")),
+        )
+        model_init_dtype = dtype_from_string(model_init_dtype_name)
+        default_dtype = torch.get_default_dtype()
+        if model_init_dtype != default_dtype:
+            self._rank_print(f"Instantiating model with default dtype {model_init_dtype_name}")
+            torch.set_default_dtype(model_init_dtype)
+        try:
+            model = instantiate(cfg.model)
+        finally:
+            if model_init_dtype != default_dtype:
+                torch.set_default_dtype(default_dtype)
 
         if cfg.pretrained_model_path is not None:
             mprint(f"Loading pretrained weights from: {cfg.pretrained_model_path}")
-            import json, gc
+            import json
             from safetensors.torch import load_file
 
             ckpt_dir = cfg.pretrained_model_path
@@ -734,6 +814,45 @@ class BaseExperiment(ABC):
                 model.action_head.inject_lora_after_loading()
 
             mprint("Successfully loaded pretrained weights")
+
+        if os.environ.get("MOVE_MODEL_TO_CUDA_AFTER_LOAD", "0").lower() in ("1", "true", "yes"):
+            if torch.cuda.is_available():
+                local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+                device = torch.device("cuda", local_rank)
+                self._rank_print(f"Moving model to {device} with dtype {model_init_dtype_name}")
+                model.to(device=device, dtype=model_init_dtype)
+                gc.collect()
+                torch.cuda.empty_cache()
+            else:
+                self._rank_print("MOVE_MODEL_TO_CUDA_AFTER_LOAD set, but CUDA is not available")
+
+        # Optional: torch.compile (Inductor kernel fusion) on the trainable DiT
+        # blocks. Gated by TORCH_COMPILE_DIT so the default path is unchanged.
+        # Done AFTER weight load + LoRA injection + move-to-cuda so the compiled
+        # graph includes the PEFT adapters and runs on the final device. We locate
+        # blocks by type via model.modules() to stay robust to PEFT/DDP wrapping,
+        # and compile in place with Module.compile() (keeps param registration,
+        # so DeepSpeed/grad still work). Compilation itself is lazy: the first
+        # training step pays the cost, then it is reused (shared Inductor cache).
+        if os.environ.get("TORCH_COMPILE_DIT", "0").lower() in ("1", "true", "yes"):
+            try:
+                from groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk import (
+                    CausalWanAttentionBlock,
+                )
+                compile_mode = os.environ.get("TORCH_COMPILE_DIT_MODE", "default")
+                n_compiled = 0
+                for sub in model.modules():
+                    if isinstance(sub, CausalWanAttentionBlock):
+                        sub.compile(mode=compile_mode)
+                        n_compiled += 1
+                self._rank_print(
+                    f"TORCH_COMPILE_DIT enabled: compiled {n_compiled} CausalWanAttentionBlock "
+                    f"module(s) with mode={compile_mode}; first step will be slow while Inductor compiles."
+                )
+            except Exception as e:  # never let a compile-setup failure kill training
+                self._rank_print(f"TORCH_COMPILE_DIT requested but setup failed ({e}); continuing in eager mode")
+
+        self._stagger_model_init_finish(stagger_state)
 
         model.config.resume_path = model.config._name_or_path = training_args.output_dir
         mprint(f"{model}\n")

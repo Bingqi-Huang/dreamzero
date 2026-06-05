@@ -125,6 +125,9 @@ The YAM and AgiBot training scripts use `pretrained_model_path=./checkpoints/Dre
 
 ## Running the Inference Server
 
+For our RTX PRO 6000 Blackwell TensorRT/NVFP4 runtime notes and benchmarked
+launch command, see [Blackwell Inference Optimization Notes](docs/BLACKWELL_INFERENCE_OPTIMIZATION.md).
+
 ### Command Overview
 
 The inference server uses PyTorch distributed training utilities to parallelize the model across multiple GPUs:

@@ -6,6 +6,8 @@ import sys
 import atexit
 import ctypes
 import modelopt.torch.quantization as mtq
+import copy
+import gc
 from typing import Dict, List, Tuple
 import shutil
 
@@ -63,9 +65,15 @@ def wan_quantize(
 ):
     """Quantize the VLA model using ModelOpt - simplified to use calc_mse_for_single_trajectory."""
 
-    # Configure quantization - disable problematic layers
+    # Configure quantization - disable problematic layers.
+    # ModelOpt 0.44 uses a list-of-dicts quant_cfg format; older configs used a
+    # mapping. Support both so local custom configs remain usable.
     if "quant_cfg" in quantization_config:
-        quantization_config["quant_cfg"]["*patch_embedding*"] = {"enable": False}
+        quant_cfg = quantization_config["quant_cfg"]
+        if isinstance(quant_cfg, list):
+            quant_cfg.append({"quantizer_name": "*patch_embedding*", "enable": False})
+        else:
+            quant_cfg["*patch_embedding*"] = {"enable": False}
     #    if model_type == "14B" or model_type == "ar_14B":
     #        # Workaround: until we understand the issue https://nvbugspro.nvidia.com/bug/5612316
     #        quantization_config["quant_cfg"]["*.self_attn.o.*"] = {"enable": False}
@@ -74,7 +82,8 @@ def wan_quantize(
     policy.trained_model.action_head.model = mtq.quantize(
         policy.trained_model.action_head.model, quantization_config, forward_loop=forward_loop
     )
-    mtq.print_quant_summary(policy.trained_model.action_head.model)
+    if os.getenv("PRINT_QUANT_SUMMARY", "false").lower() == "true":
+        mtq.print_quant_summary(policy.trained_model.action_head.model)
 
     return
 
@@ -87,22 +96,20 @@ def wan_trt_quantize_and_load_engine(
     model_type,
     forward_loop,
 ):
-    if (
-        os.path.exists(os.path.dirname(engine_path))
-        and cfg.inference_mode == "trt_build"
-    ):
-        shutil.rmtree(os.path.dirname(engine_path))
+    if cfg.inference_mode == "trt_build":
+        for path in (engine_path, onnx_path):
+            if os.path.exists(path):
+                os.remove(path)
 
     quantization_config = None
     if cfg.quantize_dtype == "fp8":
-        quantization_config = FP8_DEFAULT_CONFIG.copy()
+        quantization_config = copy.deepcopy(getattr(mtq, "FP8_DEFAULT_CFG", FP8_DEFAULT_CONFIG))
     elif cfg.quantize_dtype == "nvfp4":
-        quantization_config = NVFP4_DEFAULT_CONFIG.copy()
+        quantization_config = copy.deepcopy(getattr(mtq, "NVFP4_DEFAULT_CFG", NVFP4_DEFAULT_CONFIG))
     else:
         print(f"Quantization type {cfg.quantize_dtype} not supported. Skipping quantization.")
 
     if quantization_config is not None and cfg.inference_mode == "trt_build":
-        #policy.trained_model.action_head.model.to(torch.float16)
         wan_quantize(
             policy,
             quantization_config,
@@ -111,9 +118,18 @@ def wan_trt_quantize_and_load_engine(
         )
 
     if  cfg.inference_mode == "trt_build":
+        # Cast the DiT to fp16 for ONNX/TensorRT export AFTER calibration. The
+        # wan_quantize calibration above runs a REAL-data forward whose activations
+        # are bf16 (VAE/text/image encoders stay bf16), so the DiT must also be bf16
+        # during calibration. The ONNX export below uses fp16 test inputs
+        # (create_wan_test_inputs -> torch.float16), so the model is cast to fp16
+        # only here. NOTE: a prior change moved this cast BEFORE wan_quantize, which
+        # fed bf16 activations into an fp16 DiT and crashed calibration with
+        # "mat1 and mat2 must have the same dtype, but got BFloat16 and Half".
         policy.trained_model.action_head.model.to(torch.float16)
 
-        print("Export model:", policy.trained_model.action_head.model)
+        if os.getenv("PRINT_TRT_EXPORT_MODEL", "false").lower() == "true":
+            print("Export model:", policy.trained_model.action_head.model)
 
         test_inputs = create_wan_test_inputs(policy, device="cuda", model_type=model_type)
         min_shape = None
@@ -149,9 +165,9 @@ def wan_trt_quantize_and_load_engine(
             dynamic_axes = None
 
         if cfg.quantize_dtype == "nvfp4":
-            export_to_onnx_fp4(policy.trained_model.action_head.model, test_inputs, onnx_path, dynamic_axes=dynamic_axes)
+            exported_onnx_path = export_to_onnx_fp4(policy.trained_model.action_head.model, test_inputs, onnx_path, dynamic_axes=dynamic_axes)
         else:
-            export_to_onnx(
+            exported_onnx_path = export_to_onnx(
                 policy.trained_model.action_head.model,
                 test_inputs,
                 onnx_path,
@@ -159,8 +175,20 @@ def wan_trt_quantize_and_load_engine(
                 quantization_mode=cfg.quantize_dtype,
                 dynamic_axes=dynamic_axes,
             )
+        if exported_onnx_path is None or not os.path.exists(onnx_path):
+            raise RuntimeError(f"ONNX export failed; expected ONNX file at {onnx_path}")
+        if cfg.quantize_dtype == "nvfp4":
+            _sanitize_nvfp4_onnx_for_tensorrt(onnx_path)
 
-        build_tensorrt_engine(onnx_path, engine_path, min_shape, max_shape, opt_shape)
+        # Free the large PyTorch model before TensorRT allocates builder memory.
+        # The build script only needs the serialized engine after export.
+        policy.trained_model.action_head.model.cpu()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        built_engine_path = build_tensorrt_engine(onnx_path, engine_path, min_shape, max_shape, opt_shape)
+        if built_engine_path is None or not os.path.exists(engine_path):
+            raise RuntimeError(f"TensorRT engine build failed; expected engine at {engine_path}")
 
     trt_wan_model = load_tensorrt_engine(engine_path, model_type=model_type)
     policy.trained_model.action_head.model = trt_wan_model
@@ -174,8 +202,10 @@ def export_to_onnx_fp4(model, test_inputs, onnx_save_path, dynamic_axes=None):
         onnx_bytes, _ = get_onnx_bytes_and_metadata(model=model, dummy_input=test_inputs, dynamic_axes=dynamic_axes)
         onnx_model = OnnxBytes.from_bytes(onnx_bytes)
     except Exception as e:
-        print(f"Error exporting model to ONNX: {e}")
-        return
+        import traceback as _tb
+        print(f"Error exporting model to ONNX: {e!r}")
+        _tb.print_exc()
+        raise
     save_dir = os.path.dirname(os.path.abspath(onnx_save_path))
     os.makedirs(save_dir, exist_ok=True)
     for filename, file_bytes in onnx_model.onnx_model.items():
@@ -183,6 +213,97 @@ def export_to_onnx_fp4(model, test_inputs, onnx_save_path, dynamic_axes=None):
         with open(file_path, "wb") as f:
             f.write(file_bytes)
         print(f"exported onnx to {file_path}")
+    return onnx_save_path
+
+
+def _sanitize_nvfp4_onnx_for_tensorrt(onnx_path: str) -> None:
+    """Patch ModelOpt NVFP4 ONNX graphs for TensorRT's strict MatMul typing.
+
+    ModelOpt 0.44 can emit FP4 weight DequantizeLinear nodes whose output is
+    inferred as FP32 because the scale tensor is FP32. The matching activation
+    side is FP16, so TensorRT rejects MatMul with Half x Float inputs. Cast only
+    the FP4-weight side to FP16 before MatMul; the compressed FP4 initializer is
+    kept intact.
+    """
+    import onnx
+    from onnx import TensorProto, helper
+
+    model = onnx.load(onnx_path, load_external_data=False)
+    producers = {output: node for node in model.graph.node for output in node.output}
+    new_nodes = []
+    cast_outputs: dict[tuple[str, str], str] = {}
+    matmul_patched = 0
+    layernorm_patched = 0
+
+    def is_fp4_weight_transpose(value_name: str) -> bool:
+        transpose = producers.get(value_name)
+        if transpose is None or transpose.op_type != "Transpose" or not transpose.input:
+            return False
+        dq = producers.get(transpose.input[0])
+        return (
+            dq is not None
+            and dq.op_type == "DequantizeLinear"
+            and bool(dq.input)
+            and dq.input[0].endswith("_f4")
+        )
+
+    def static_tensor_dtype(value_name: str) -> int | None:
+        for init in model.graph.initializer:
+            if init.name == value_name:
+                return init.data_type
+        producer = producers.get(value_name)
+        if producer is None or producer.op_type != "Constant":
+            return None
+        for attr in producer.attribute:
+            if attr.name == "value":
+                return attr.t.data_type
+        return None
+
+    def cast_to_fp16(value_name: str, node_name: str, reason: str) -> str:
+        key = (value_name, reason)
+        cast_output = cast_outputs.get(key)
+        if cast_output is not None:
+            return cast_output
+        cast_output = f"{value_name}_{reason}_fp16"
+        cast_node = helper.make_node(
+            "Cast",
+            inputs=[value_name],
+            outputs=[cast_output],
+            name=f"{node_name or 'node'}_{reason}_cast_fp16",
+            to=TensorProto.FLOAT16,
+        )
+        new_nodes.append(cast_node)
+        cast_outputs[key] = cast_output
+        return cast_output
+
+    for node in model.graph.node:
+        if node.op_type == "MatMul":
+            for input_idx, input_name in enumerate(list(node.input)):
+                if not is_fp4_weight_transpose(input_name):
+                    continue
+                node.input[input_idx] = cast_to_fp16(input_name, node.name or "MatMul", "fp4_weight")
+                matmul_patched += 1
+        elif node.op_type == "LayerNormalization" and len(node.input) >= 2:
+            if (
+                static_tensor_dtype(node.input[1]) == TensorProto.FLOAT16
+                and not node.input[0].endswith("_layernorm_input_fp16")
+            ):
+                node.input[0] = cast_to_fp16(node.input[0], node.name or "LayerNormalization", "layernorm_input")
+                layernorm_patched += 1
+        new_nodes.append(node)
+
+    if matmul_patched == 0 and layernorm_patched == 0:
+        print("  NVFP4 ONNX sanitization: no TensorRT MatMul type patches needed")
+        return
+
+    del model.graph.node[:]
+    model.graph.node.extend(new_nodes)
+    onnx.save(model, onnx_path)
+    print(
+        "  NVFP4 ONNX sanitization: inserted "
+        f"{len(cast_outputs)} FP16 casts "
+        f"({matmul_patched} MatMul inputs, {layernorm_patched} LayerNorm inputs)"
+    )
 
 
 def export_to_onnx(
@@ -336,9 +457,110 @@ def export_to_onnx_14B(pytorch_model, test_inputs, onnx_path="tensorrt/wan_model
         return None
 
 
+def _parse_trt_shape_spec(shape_spec: str | None) -> dict[str, tuple[int, ...]]:
+    if shape_spec is None:
+        return {}
+    shapes: dict[str, tuple[int, ...]] = {}
+    for item in shape_spec.split(","):
+        name, raw_shape = item.split(":", 1)
+        shapes[name] = tuple(int(dim) for dim in raw_shape.split("x"))
+    return shapes
+
+
+def _set_builder_flag_if_available(config, flag_name: str) -> None:
+    if hasattr(trt.BuilderFlag, flag_name):
+        try:
+            config.set_flag(getattr(trt.BuilderFlag, flag_name))
+            print(f"  Enabled TensorRT builder flag: {flag_name}")
+        except Exception as exc:
+            print(f"  Warning: failed to enable TensorRT builder flag {flag_name}: {exc}")
+
+
+def _build_tensorrt_engine_python(onnx_path, engine_path, min_shape=None, max_shape=None, opt_shape=None):
+    """Build TensorRT engine with the Python API when trtexec is unavailable."""
+    print("Building TensorRT engine with Python API fallback...")
+    onnx_path = os.path.abspath(onnx_path)
+    engine_path = os.path.abspath(engine_path)
+    onnx_dir = os.path.dirname(onnx_path)
+
+    logger = trt.Logger(trt.Logger.INFO)
+    builder = trt.Builder(logger)
+    network_flags = 0
+    if (
+        hasattr(trt, "NetworkDefinitionCreationFlag")
+        and hasattr(trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH")
+    ):
+        network_flags |= 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    network = builder.create_network(network_flags)
+    parser = trt.OnnxParser(network, logger)
+
+    old_cwd = os.getcwd()
+    try:
+        # TensorRT resolves ONNX external-data tensors relative to cwd.
+        os.chdir(onnx_dir)
+        with open(onnx_path, "rb") as f:
+            parsed = parser.parse(f.read())
+    finally:
+        os.chdir(old_cwd)
+    if not parsed:
+        print("  ERROR: ONNX parse failed")
+        for idx in range(parser.num_errors):
+            print(f"    {parser.get_error(idx)}")
+        return None
+
+    config = builder.create_builder_config()
+    if hasattr(config, "set_memory_pool_limit") and hasattr(trt, "MemoryPoolType"):
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 64 << 30)
+    elif hasattr(config, "max_workspace_size"):
+        config.max_workspace_size = 64 << 30
+
+    # Mirror the original trtexec flags (--fp8 --fp16 --bf16) where supported.
+    for flag_name in ("FP16", "BF16", "FP8", "FP4"):
+        _set_builder_flag_if_available(config, flag_name)
+
+    min_shapes = _parse_trt_shape_spec(min_shape)
+    opt_shapes = _parse_trt_shape_spec(opt_shape)
+    max_shapes = _parse_trt_shape_spec(max_shape)
+    if min_shapes or opt_shapes or max_shapes:
+        profile = builder.create_optimization_profile()
+        for input_idx in range(network.num_inputs):
+            tensor = network.get_input(input_idx)
+            name = tensor.name
+            shape = tuple(int(dim) for dim in tensor.shape)
+            if name in min_shapes:
+                profile.set_shape(name, min_shapes[name], opt_shapes[name], max_shapes[name])
+                print(
+                    f"  Dynamic shape profile for {name}: "
+                    f"min={min_shapes[name]} opt={opt_shapes[name]} max={max_shapes[name]}"
+                )
+            elif any(dim < 0 for dim in shape):
+                print(f"  ERROR: dynamic input {name} has no profile shape. Tensor shape: {shape}")
+                return None
+        config.add_optimization_profile(profile)
+
+    try:
+        serialized_engine = builder.build_serialized_network(network, config)
+    except AttributeError:
+        engine = builder.build_engine(network, config)
+        serialized_engine = engine.serialize() if engine is not None else None
+
+    if serialized_engine is None:
+        print("  ERROR: TensorRT Python API failed to build serialized engine")
+        return None
+
+    os.makedirs(os.path.dirname(engine_path), exist_ok=True)
+    with open(engine_path, "wb") as f:
+        f.write(bytes(serialized_engine))
+    print(f"  TensorRT engine built successfully: {engine_path}")
+    return engine_path
+
+
 def build_tensorrt_engine(onnx_path, engine_path="tensorrt/wan_model.trt", min_shape=None, max_shape=None, opt_shape=None):
     """Build TensorRT engine from ONNX using trtexec"""
     print("Building TensorRT engine with trtexec...")
+    onnx_path = os.path.abspath(onnx_path)
+    engine_path = os.path.abspath(engine_path)
+    onnx_dir = os.path.dirname(onnx_path)
 
     if not os.path.exists(onnx_path):
         print(f"  ERROR: ONNX file not found: {onnx_path}")
@@ -348,7 +570,13 @@ def build_tensorrt_engine(onnx_path, engine_path="tensorrt/wan_model.trt", min_s
     os.makedirs(os.path.dirname(engine_path), exist_ok=True)
 
     # Build engine using trtexec (much faster than torch_tensorrt)
-    trtexec_bin = shutil.which("trtexec") or "/opt/tensorrt/bin/trtexec"
+    trtexec_bin = os.getenv("TRTEXEC_PATH") or shutil.which("trtexec") or "/opt/tensorrt/bin/trtexec"
+    if not os.path.exists(trtexec_bin):
+        print(
+            "  trtexec was not found. Install TensorRT CLI tools or set "
+            f"TRTEXEC_PATH to the trtexec binary to use the CLI builder. Tried: {trtexec_bin}"
+        )
+        return _build_tensorrt_engine_python(onnx_path, engine_path, min_shape, max_shape, opt_shape)
     cmd = [
         trtexec_bin,
         f"--onnx={onnx_path}",
@@ -380,7 +608,7 @@ def build_tensorrt_engine(onnx_path, engine_path="tensorrt/wan_model.trt", min_s
         print(f"  Logging output to: {log_file}")
 
         with open(log_file, "w") as f:
-            result = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, text=True, timeout=600)
+            result = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, text=True, timeout=3600, cwd=onnx_dir)
 
         if result.returncode == 0:
             print(f"  TensorRT engine built successfully: {engine_path}")
@@ -402,7 +630,7 @@ def build_tensorrt_engine(onnx_path, engine_path="tensorrt/wan_model.trt", min_s
             return None
 
     except subprocess.TimeoutExpired:
-        print("  ERROR: trtexec timed out after 5 minutes")
+        print("  ERROR: trtexec timed out after 60 minutes")
         print(f"  Partial build log saved to: {log_file}")
         return None
     except Exception as e:
@@ -481,11 +709,14 @@ class Engine(object):
                 self.in_meta.append([tensor_name, shape, dtype])
             else:
                 self.out_meta.append([tensor_name, shape, dtype])
+        self.input_names = {item[0] for item in self.in_meta}
 
     def __call__(self, *args, **inputs):
         return self.forward(*args, **inputs)
 
     def set_runtime_tensor_shape(self, name, shape):
+        if name not in self.input_names:
+            return
         self.execution_context.set_input_shape(name, shape)
 
     def forward(self, *args, **kwargs):
@@ -656,14 +887,14 @@ class WanTrtModelAr5B(torch.nn.Module):
 
 
         output = self.engine(
-            x.to(torch.float16),
-            timestep.to(torch.float16),
-            context.to(torch.float16),
-            kv_cache_packed.to(torch.float16),
+            x=x.to(torch.float16),
+            timestep=timestep.to(torch.float16),
+            context=context.to(torch.float16),
+            kv_cache_packed=kv_cache_packed.to(torch.float16),
             # y.to(torch.float16),
-            action.to(torch.float16),
-            timestep_action.to(torch.float16),
-            state.to(torch.float16),
+            action=action.to(torch.float16),
+            timestep_action=timestep_action.to(torch.float16),
+            state=state.to(torch.float16),
         )
 
         if "out.0" in output: # for nvfp4 model export through modelopt
@@ -704,15 +935,15 @@ class WanTrtModelAr14B(torch.nn.Module):
 
 
         output = self.engine(
-            x.to(torch.float16),
-            timestep.to(torch.float16),
-            context.to(torch.float16),
-            kv_cache_packed.to(torch.float16),
-            y.to(torch.float16),
-            clip_feature.to(torch.float16),
-            action.to(torch.float16),
-            timestep_action.to(torch.float16),
-            state.to(torch.float16),
+            x=x.to(torch.float16),
+            timestep=timestep.to(torch.float16),
+            context=context.to(torch.float16),
+            kv_cache_packed=kv_cache_packed.to(torch.float16),
+            y=y.to(torch.float16),
+            clip_feature=clip_feature.to(torch.float16),
+            action=action.to(torch.float16),
+            timestep_action=timestep_action.to(torch.float16),
+            state=state.to(torch.float16),
         )
 
         if "out.0" in output: # for nvfp4 model export through modelopt
@@ -848,5 +1079,3 @@ def create_wan_test_inputs(policy, device="cuda", model_type="5B"):
         kv_cache_packed = torch.stack(kv_cache, dim=0)
         crossattn_packed = torch.stack(crossattn_k_cache, dim=0)
         return (x, timestep, context, kv_cache_packed, y, clip_feature, action, timestep_action, state)
-
-

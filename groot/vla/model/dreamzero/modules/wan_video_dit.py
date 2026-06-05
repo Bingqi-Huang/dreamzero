@@ -43,12 +43,14 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
     
 ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
+DISABLE_TORCH_COMPILE_ENV = os.getenv("DISABLE_TORCH_COMPILE", "False").lower() in ("1", "true", "yes")
+TORCHDYNAMO_DISABLED_ENV = os.getenv("TORCHDYNAMO_DISABLE", "0").lower() in ("1", "true", "yes")
 if ENABLE_TENSORRT:
     # disable torch compile and transformer engine and flash attention for onnx/tensorrt export
     FLASH_ATTN_COMPATIBILITY_MODE = True
     DISABLE_TORCH_COMPILE = True
 else:
-    DISABLE_TORCH_COMPILE = False
+    DISABLE_TORCH_COMPILE = DISABLE_TORCH_COMPILE_ENV or TORCHDYNAMO_DISABLED_ENV
     FLASH_ATTN_COMPATIBILITY_MODE = False
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
     # Use PyTorch SDPA on pre-Ampere GPUs or when compatibility_mode (FlashAttention requires Ampere or newer)

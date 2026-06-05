@@ -39,6 +39,12 @@ class HuggingfaceTokenizer:
 
     def __init__(self, name, seq_len=None, clean=None, **kwargs):
         assert clean in (None, 'whitespace')
+        if os.path.isabs(name) and not os.path.exists(name):
+            fallback_name = os.environ.get("DREAMZERO_TOKENIZER_PATH", "google/umt5-xxl")
+            print(
+                f"Tokenizer path {name} does not exist; using {fallback_name} instead."
+            )
+            name = fallback_name
         self.name = name
         self.seq_len = seq_len
         self.clean = clean
@@ -49,7 +55,21 @@ class HuggingfaceTokenizer:
         if os.path.isdir(name):
             load_kwargs.setdefault("local_files_only", True)
         # init tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(name, **load_kwargs)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(name, **load_kwargs)
+        except OSError:
+            if (
+                name == "google/umt5-xxl"
+                and os.environ.get("HF_ENDPOINT") != "https://huggingface.co"
+            ):
+                print(
+                    "Failed to load google/umt5-xxl from current HF_ENDPOINT; "
+                    "retrying with https://huggingface.co."
+                )
+                os.environ["HF_ENDPOINT"] = "https://huggingface.co"
+                self.tokenizer = AutoTokenizer.from_pretrained(name, **load_kwargs)
+            else:
+                raise
         self.vocab_size = self.tokenizer.vocab_size
 
     def __call__(self, sequence, **kwargs):
@@ -124,6 +144,8 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + processed_item.lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.REALMAN.value]:
+                        processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the nominal camera, the top-right view shows the second perturbed camera, the bottom-left view shows the first perturbed camera, and the bottom-right view is a black screen. The robot " + processed_item.lower()
                     else:
                         raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.") 
                     output_values.append(processed_item)  
@@ -146,6 +168,8 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + str(item).lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.REALMAN.value]:
+                        item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the nominal camera, the top-right view shows the second perturbed camera, the bottom-left view shows the first perturbed camera, and the bottom-right view is a black screen. The robot " + str(item).lower()
                     else:
                         raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")   
                     output_values.append(item)
@@ -627,4 +651,3 @@ class DreamTransform(InvertibleModalityTransform):
 
     def __call__(self, data: dict) -> dict:
         return self.apply(data)
-

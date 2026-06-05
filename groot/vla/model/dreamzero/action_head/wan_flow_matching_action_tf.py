@@ -235,33 +235,40 @@ class WANPolicyHead(ActionHead):
         self.cpu_offload = False
 
         self.model = instantiate(config.diffusion_model_cfg)
+        # CausalWanModel hardcodes self.gradient_checkpointing=True in its __init__,
+        # so config.use_gradient_checkpointing was previously dead. Propagate it here
+        # (before LoRA wrapping, so it persists on the nested module under PEFT). With
+        # ~26GB/GPU headroom on 96GB cards, disabling GC removes the backward recompute
+        # (~2.5x forward observed) at the cost of activation memory.
+        if hasattr(self.model, "gradient_checkpointing"):
+            self.model.gradient_checkpointing = self.use_gradient_checkpointing
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
         
-        text_enc_path = ensure_file(
-            self.text_encoder.text_encoder_pretrained_path,
-            "models_t5_umt5-xxl-enc-bf16.pth",
-        )
-        self.text_encoder.load_state_dict(torch.load(text_enc_path, map_location='cpu'))
-
-        img_enc_path = ensure_file(
-            self.image_encoder.image_encoder_pretrained_path,
-            "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
-        )
-        self.image_encoder.model.load_state_dict(torch.load(img_enc_path, map_location='cpu'), strict=False)
-
-        # Wan2.2 (WanVideoVAE38, z_dim=48) uses Wan2.2_VAE.pth; Wan2.1 uses Wan2.1_VAE.pth
-        vae_hf_filename = "Wan2.2_VAE.pth" if getattr(self.vae, "z_dim", 16) == 48 else "Wan2.1_VAE.pth"
-        vae_repo_id = WAN22_HF_REPO_ID if getattr(self.vae, "z_dim", 16) == 48 else WAN_HF_REPO_ID
-        vae_path = ensure_file(
-            self.vae.vae_pretrained_path,
-            vae_hf_filename,
-            repo_id=vae_repo_id,
-        )
-        self.vae.model.load_state_dict(torch.load(vae_path, map_location='cpu'))
-
         if not config.skip_component_loading:
+            text_enc_path = ensure_file(
+                self.text_encoder.text_encoder_pretrained_path,
+                "models_t5_umt5-xxl-enc-bf16.pth",
+            )
+            self.text_encoder.load_state_dict(torch.load(text_enc_path, map_location='cpu'))
+
+            img_enc_path = ensure_file(
+                self.image_encoder.image_encoder_pretrained_path,
+                "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+            )
+            self.image_encoder.model.load_state_dict(torch.load(img_enc_path, map_location='cpu'), strict=False)
+
+            # Wan2.2 (WanVideoVAE38, z_dim=48) uses Wan2.2_VAE.pth; Wan2.1 uses Wan2.1_VAE.pth
+            vae_hf_filename = "Wan2.2_VAE.pth" if getattr(self.vae, "z_dim", 16) == 48 else "Wan2.1_VAE.pth"
+            vae_repo_id = WAN22_HF_REPO_ID if getattr(self.vae, "z_dim", 16) == 48 else WAN_HF_REPO_ID
+            vae_path = ensure_file(
+                self.vae.vae_pretrained_path,
+                vae_hf_filename,
+                repo_id=vae_repo_id,
+            )
+            self.vae.model.load_state_dict(torch.load(vae_path, map_location='cpu'))
+
             dit_dir = self.model.diffusion_model_pretrained_path
             # Wan2.2 (in_dim=48) uses Wan2.2-TI2V-5B repo; Wan2.1 uses Wan2.1-I2V-14B-480P
             dit_repo_id = WAN22_HF_REPO_ID if getattr(self.model, "in_dim", 16) == 48 else WAN_HF_REPO_ID
@@ -309,7 +316,7 @@ class WANPolicyHead(ActionHead):
 
                 print("Successfully loaded pretrained weights")
         else:
-            print("Skipping individual component loading (loading from full pretrained model)")
+            print("Skipping individual component loading; expecting full checkpoint loading via pretrained_model_path")
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         # Video noise Beta distribution (biased towards high noise levels when enabled)
         self.video_beta_dist = Beta(config.video_noise_beta_alpha, config.video_noise_beta_beta)
@@ -1358,10 +1365,11 @@ class WANPolicyHead(ActionHead):
         import os
         ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
         LOAD_TRT_ENGINE = os.getenv("LOAD_TRT_ENGINE", None)
+        DISABLE_TORCH_COMPILE = os.getenv("DISABLE_TORCH_COMPILE", "False").lower() in ("1", "true", "yes")
 
         # Torch compile the modules. Skip _forward_blocks: Dynamo with fullgraph can fail on
         # shape variation (e.g. x [1,50,C] vs e [1,200,C]); the block aligns e to x at runtime.
-        if not ENABLE_TENSORRT:
+        if not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE:
             print("Torch compiling the TextEncoder, ImageEncoder, and VAE modules (Wan _forward_blocks not compiled).")
 
             self.text_encoder.forward = torch.compile(
@@ -1375,6 +1383,8 @@ class WANPolicyHead(ActionHead):
             self.vae.model.encode = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
             )(self.vae.model.encode)
+        elif DISABLE_TORCH_COMPILE:
+            print("Skipping torch.compile because DISABLE_TORCH_COMPILE is set.")
         
         self.trt_engine = None
         if LOAD_TRT_ENGINE is not None:

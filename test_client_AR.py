@@ -191,7 +191,7 @@ def test_ar_droid_policy_server(
     When use_zero_images is False (default), loads real video frames from
     debug_image/ and follows the frame schedule from debug_inference.py.
     """
-    logging.info(f"Connecting to AR_droid server at {host}:{port}...")
+    logging.info(f"Connecting to DreamZero server at {host}:{port}...")
     
     client = WebsocketClientPolicy(host=host, port=port)
     
@@ -206,13 +206,13 @@ def test_ar_droid_policy_server(
         logging.error(f"Error parsing metadata: {e}")
         raise e
     
-    # Validate expected AR_droid configuration
+    # Validate expected camera configuration for this smoke test.
     logging.info(f"Server config: {server_config}")
     assert server_config.n_external_cameras == 2, f"Expected 2 external cameras, got {server_config.n_external_cameras}"
     assert server_config.needs_wrist_camera, "Expected wrist camera to be enabled"
     assert server_config.action_space == "joint_position", f"Expected joint_position action space, got {server_config.action_space}"
     
-    logging.info("Server configuration validated for AR_droid")
+    logging.info("Server configuration validated")
     
     # Generate unique session ID for this test run
     import uuid
@@ -278,8 +278,8 @@ def _log_action(actions: np.ndarray, dt: float) -> None:
     """Pretty-print action shape, range, and timing."""
     assert isinstance(actions, np.ndarray), f"Expected numpy array, got {type(actions)}"
     assert actions.ndim == 2, f"Expected 2D array, got shape {actions.shape}"
-    assert actions.shape[-1] == 8, (
-        f"Expected 8 action dims (7 joints + 1 gripper), got {actions.shape[-1]}"
+    assert actions.shape[-1] in (8, 22), (
+        f"Expected 8 Droid dims or 22 AgiBot dims, got {actions.shape[-1]}"
     )
     logging.info(
         f"  Action shape: {actions.shape}, "

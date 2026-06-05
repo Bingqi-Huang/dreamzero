@@ -48,8 +48,8 @@ from groot.control.tensorrt_utils import (
     create_wan_test_inputs,
 )
 
-# DreamZero-DROID uses the ar_14B_droid model type in tensorrt_utils.
-_MODEL_TYPE = "ar_14B_droid"
+DEFAULT_MODEL_TYPE = "ar_14B"
+DEFAULT_EMBODIMENT_TAG = "agibot"
 
 
 def _init_single_gpu_mesh():
@@ -66,7 +66,7 @@ def _init_single_gpu_mesh():
     return mesh
 
 
-def _make_dummy_forward_loop():
+def _make_dummy_forward_loop(model_type: str):
     """Fallback calibration using random dummy inputs.
 
     Acceptable for fp16 (no quantization), but may reduce accuracy for
@@ -74,8 +74,11 @@ def _make_dummy_forward_loop():
     Prefer _make_dataset_forward_loop when a dataset is available.
     """
     def forward_loop(model):
-        trt_forward = getattr(model, "_forward_inference_trt_droid", model.forward)
-        test_inputs = create_wan_test_inputs(None, device="cuda", model_type=_MODEL_TYPE)
+        if model_type == "ar_14B_droid":
+            trt_forward = getattr(model, "_forward_inference_trt_droid", model.forward)
+        else:
+            trt_forward = getattr(model, "_forward_inference_trt", model.forward)
+        test_inputs = create_wan_test_inputs(None, device="cuda", model_type=model_type)
         for _ in range(16):
             with torch.no_grad():
                 trt_forward(*test_inputs)
@@ -156,6 +159,21 @@ def main():
     )
     parser.add_argument("--model-path", required=True, help="Path to checkpoint directory.")
     parser.add_argument(
+        "--embodiment-tag",
+        default=DEFAULT_EMBODIMENT_TAG,
+        help="Embodiment tag to load from checkpoint metadata (default: agibot).",
+    )
+    parser.add_argument(
+        "--model-type",
+        default=DEFAULT_MODEL_TYPE,
+        choices=["ar_14B", "ar_14B_droid", "ar_5B_n6"],
+        help=(
+            "TensorRT shape/template type from tensorrt_utils. "
+            "Use ar_14B for DreamZero-AgiBot action_horizon=48, "
+            "ar_14B_droid for DROID action_horizon=24."
+        ),
+    )
+    parser.add_argument(
         "--tensorrt",
         required=True,
         choices=["nvfp4", "fp8", "fp16"],
@@ -165,7 +183,7 @@ def main():
         "--dataset-path",
         default=None,
         help=(
-            "Path to a LeRobot-format DROID dataset for real calibration. "
+            "Path to a LeRobot-format dataset for real calibration. "
             "Strongly recommended for nvfp4/fp8 — random dummy inputs are used as "
             "fallback but may reduce quantization accuracy."
         ),
@@ -182,7 +200,7 @@ def main():
         logger.warning(
             "No --dataset-path provided for %s quantization. "
             "Falling back to random dummy inputs — this may reduce engine accuracy. "
-            "Re-run with --dataset-path <path/to/droid_lerobot> for best results.",
+            "Re-run with --dataset-path <path/to/lerobot_dataset> for best results.",
             args.tensorrt,
         )
 
@@ -199,11 +217,13 @@ def main():
     logger.info("Loading DreamZero policy from : %s", args.model_path)
     logger.info("Target engine path            : %s", engine_path)
     logger.info("Quantization precision        : %s", args.tensorrt)
+    logger.info("Embodiment tag                : %s", args.embodiment_tag)
+    logger.info("TensorRT model type           : %s", args.model_type)
 
     device_mesh = _init_single_gpu_mesh()
 
     policy = GrootSimPolicy(
-        embodiment_tag=EmbodimentTag("oxe_droid"),
+        embodiment_tag=EmbodimentTag(args.embodiment_tag),
         model_path=args.model_path,
         device="cuda" if torch.cuda.is_available() else "cpu",
         device_mesh=device_mesh,
@@ -220,7 +240,7 @@ def main():
             args.dataset_path,
         )
     else:
-        forward_loop = _make_dummy_forward_loop()
+        forward_loop = _make_dummy_forward_loop(args.model_type)
         logger.info("Calibration: using random dummy inputs (no --dataset-path given).")
 
     # cfg mimics the Hydra config used by the internal eval script.
@@ -232,7 +252,7 @@ def main():
         cfg=cfg,
         onnx_path=onnx_path,
         engine_path=engine_path,
-        model_type=_MODEL_TYPE,
+        model_type=args.model_type,
         forward_loop=forward_loop,
     )
 

@@ -15,6 +15,9 @@ import datetime
 
 from groot.vla.model.n1_5.sim_policy import GrootSimPolicy
 from groot.vla.data.schema import EmbodimentTag
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'scripts', 'inference'))
+from realman_conversion import RealmanConverter
 import imageio
 import numpy as np
 
@@ -476,6 +479,12 @@ class WebsocketPolicyServer:
         self.video_across_time = []
         self._msg_index = 0
         self._signal_group = signal_group
+        # Realman obs/action conversion (3 views, frame accumulation, (N,8) out).
+        # NO unit conversion: the RoboCOIN robot class already does deg<->rad, and
+        # training data is radians (verified). num_frames mirrors the AR streaming
+        # server's FRAMES_PER_CHUNK=4 (frames per autoregressive call), NOT the
+        # 33-frame training clip. VERIFY num_frames + relative-decode via open-loop.
+        self._converter = RealmanConverter(num_frames=4, joint_deg_to_rad=False)
         # Create output directory if specified
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
@@ -644,6 +653,7 @@ class WebsocketPolicyServer:
         packer = msgpack_numpy.Packer()
 
         await websocket.send(packer.pack(self._metadata))
+        self._converter.reset()  # fresh frame buffer per rollout connection
 
         prev_total_time = None
         signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
@@ -655,6 +665,7 @@ class WebsocketPolicyServer:
                     data = await websocket.recv()
                     recv_done = time.perf_counter()
                     obs = msgpack_numpy.unpackb(data)
+                    obs = self._converter.obs_to_model(obs)  # client schema -> model modality keys
                     print(f"Wait Time: {recv_done - start_time:.2f} seconds")
                     self._msg_index += 1
 
@@ -754,7 +765,9 @@ class WebsocketPolicyServer:
                             out[k] = getattr(batch, k)
                         return out
                     action_chunk_dict = batch_to_dict(action_chunk_dict)
-                    await websocket.send(packer.pack(action_chunk_dict))
+                    actions = self._converter.action_to_chunk(action_chunk_dict)  # -> (N,8) robot units
+                    self._converter.mark_not_first()
+                    await websocket.send(packer.pack({"actions": actions, "server_timing": {}}))
 
                 except websockets.ConnectionClosed:
                     logger.info(f"Connection from {websocket.remote_address} closed")
@@ -844,7 +857,7 @@ def main(args: Args) -> None:
     # to autoregressive nature of the model (several possible shapes).
     torch._dynamo.config.recompile_limit = 800
 
-    embodiment_tag = "agibot"
+    embodiment_tag = "realman"
     model_path = args.model_path
     policy_metadata = {
         "embodiment": embodiment_tag,
@@ -884,45 +897,20 @@ def main(args: Args) -> None:
         output_dir = None
         logging.info(f"Rank {rank} starting as worker for distributed inference...")
     
-    # Create wrapper policy that converts between roboarena and AR_droid formats
-    wrapper_policy = ARDroidRoboarenaPolicy(
-        groot_policy=policy,
-        signal_group=signal_group,
+    # Serve via the openpi websocket protocol on ALL ranks: rank 0 handles the
+    # client connection (recv obs -> RealmanConverter.obs_to_model -> distributed
+    # forward -> RealmanConverter.action_to_chunk -> (N,8)); other ranks run the
+    # distributed worker loop. (RoboarenaServer/ARDroidRoboarenaPolicy are unused
+    # for Realman because the DreamZero client speaks the native (N,8) schema.)
+    server = WebsocketPolicyServer(
+        policy=policy,
+        host="0.0.0.0",
+        port=args.port,
+        metadata=policy_metadata,
         output_dir=output_dir,
+        signal_group=signal_group,
     )
-    
-    # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
-    server_config = PolicyServerConfig(
-        image_resolution=(180, 320),  # AR_droid expects 180x320 images
-        needs_wrist_camera=True,
-        n_external_cameras=2,
-        needs_stereo_camera=False,
-        needs_session_id=True,  # Track session to reset state for new clients
-        action_space="joint_position",
-    )
-    
-    if rank == 0:
-        logging.info("Using roboarena policy server interface")
-        logging.info(f"Server config: {server_config}")
-        roboarena_server = RoboarenaServer(
-            policy=wrapper_policy,
-            server_config=server_config,
-            host="0.0.0.0",
-            port=args.port,
-        )
-        roboarena_server.serve_forever()
-    else:
-        # Non-rank-0 processes need to run worker loop for distributed inference
-        # We'll use the existing WebsocketPolicyServer's worker loop mechanism
-        server = WebsocketPolicyServer(
-            policy=policy,
-            host="0.0.0.0",
-            port=args.port,
-            metadata=policy_metadata,
-            output_dir=output_dir,
-            signal_group=signal_group,
-        )
-        asyncio.run(server._worker_loop())
+    server.serve_forever(rank)
     
 
 

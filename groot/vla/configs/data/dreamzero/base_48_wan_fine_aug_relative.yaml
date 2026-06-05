@@ -343,6 +343,84 @@ transform_yam:
 
 
 ################################################################################
+# realman (Realman: 7 joints + gripper, 3 synchronized views)
+################################################################################
+
+modality_config_realman:
+  video:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+    eval_delta_indices: [0]
+    modality_keys:
+      # These names come from observation.images.<name> in the Realman LeRobot datasets.
+      # DreamTransform lays them out as:
+      #   [nominal_image | purturbated_c2_image]
+      #   [purturbated_c1_image | black screen]
+      - video.nominal_image
+      - video.purturbated_c1_image
+      - video.purturbated_c2_image
+  state:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - state.joint_pos
+      - state.gripper_pos
+  action:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    modality_keys:
+      - action.joint_pos
+      - action.gripper_pos
+  language:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - annotation.task_index
+
+transform_realman:
+  _target_: groot.vla.data.transform.ComposedModalityTransform
+  transforms:
+    # Video transforms
+    - <<: *totensor_cfg
+      apply_to: ${modality_config_realman.video.modality_keys}
+    - <<: *crop_cfg
+      apply_to: ${modality_config_realman.video.modality_keys}
+    - <<: *resize_cfg
+      apply_to: ${modality_config_realman.video.modality_keys}
+    - <<: *color_jitter_cfg
+      apply_to: ${modality_config_realman.video.modality_keys}
+    - <<: *to_numpy_cfg
+      apply_to: ${modality_config_realman.video.modality_keys}
+
+    # State transforms
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_realman.state.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_realman.state.modality_keys}
+      normalization_modes:
+        state.joint_pos: q99
+        state.gripper_pos: q99
+
+    # Action transforms
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_realman.action.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_realman.action.modality_keys}
+      normalization_modes:
+        action.joint_pos: q99
+        action.gripper_pos: q99
+
+    # ConcatTransform
+    - _target_: groot.vla.data.transform.ConcatTransform
+      video_concat_order: ${modality_config_realman.video.modality_keys}
+      state_concat_order: ${modality_config_realman.state.modality_keys}
+      action_concat_order: ${modality_config_realman.action.modality_keys}
+
+    # Model-specific transform
+    - ${model_specific_transform}
+
+
+################################################################################
 # Modality Configs
 ################################################################################
 
@@ -350,6 +428,7 @@ modality_configs:
   oxe_droid: ${modality_config_oxe_droid}
   agibot: ${modality_config_agibot}
   yam: ${modality_config_yam}
+  realman: ${modality_config_realman}
 
 ################################################################################
 # Transforms
@@ -359,6 +438,7 @@ transforms:
   oxe_droid: ${transform_oxe_droid}
   agibot: ${transform_agibot}
   yam: ${transform_yam}
+  realman: ${transform_realman}
 
 ################################################################################
 # Metadata Versions
@@ -368,6 +448,7 @@ metadata_versions:
   oxe_droid: '0221'
   agibot: '0221'
   yam: '0221'
+  realman: '0221'
 
 ################################################################################
 # FPS (per embodiment, null means use dataset default)
@@ -375,3 +456,4 @@ metadata_versions:
 
 fps:
   yam: 30
+  realman: 15
